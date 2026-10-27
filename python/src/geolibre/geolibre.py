@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
 import csv
@@ -597,12 +598,19 @@ class Map(anywidget.AnyWidget):
 
     @staticmethod
     def _wait_for_result(slot: dict[str, Any], method: str, timeout: float) -> None:
-        """Block the kernel until a result slot resolves or the timeout elapses.
+        """Block until a result slot resolves or the timeout elapses.
 
         Jupyter comms are asynchronous, so the kernel must keep processing
         incoming messages while the calling cell blocks. ``jupyter_ui_poll``
         pumps the kernel's event loop re-entrantly (handling the ipykernel
         version differences) so the ``on_msg`` reply lands and fills the slot.
+
+        Outside Jupyter there is no kernel to pump (e.g., inside a Shiny app,
+        where the reply is delivered by the app's asyncio event loop). Blocking
+        is then only legitimate on a thread that is not running an event loop
+        (e.g., a worker thread), which keeps the loop that delivers the reply
+        free; a plain sleep-poll is enough. Blocking a thread that is running
+        an event loop would deadlock, so that case raises instead.
 
         Args:
             slot: The pending request slot, resolved in place by ``_on_custom_msg``.
@@ -611,15 +619,14 @@ class Map(anywidget.AnyWidget):
 
         Raises:
             TimeoutError: If no reply arrives within ``timeout`` seconds.
-            RuntimeError: If ``jupyter_ui_poll`` is not installed.
+            RuntimeError: If no kernel pump is available and the calling
+                thread is running an asyncio event loop.
         """
         try:
             from jupyter_ui_poll import ui_events
-        except ImportError as exc:
-            raise RuntimeError(
-                "Interactive GeoLibre queries require the 'jupyter_ui_poll' "
-                "package. Install it with `pip install jupyter_ui_poll`."
-            ) from exc
+        except ImportError:
+            ui_events = None  # type: ignore[assignment]
+
         deadline = time.monotonic() + timeout
 
         def _check_deadline() -> None:
@@ -631,18 +638,51 @@ class Map(anywidget.AnyWidget):
                     "timeout=."
                 )
 
-        with ui_events() as poll:
-            while not slot["done"]:
-                # Check before and after pumping: a slow poll() with a large event
-                # backlog could otherwise overrun a very small timeout.
-                _check_deadline()
-                poll(10)
-                if slot["done"]:
-                    break
-                _check_deadline()
-                # 20 Hz: imperceptible latency, far less CPU than a 100 Hz spin
-                # (jupyter_ui_poll already pumps 10 kernel events per iteration).
-                time.sleep(0.05)
+        if ui_events is not None:
+            try:
+                with ui_events() as poll:
+                    while not slot["done"]:
+                        # Check before and after pumping: a slow poll() with a
+                        # large event backlog could otherwise overrun a very
+                        # small timeout.
+                        _check_deadline()
+                        poll(10)
+                        if slot["done"]:
+                            break
+                        _check_deadline()
+                        # 20 Hz: imperceptible latency, far less CPU than a 100
+                        # Hz spin (jupyter_ui_poll already pumps 10 kernel
+                        # events per iteration).
+                        time.sleep(0.05)
+                return
+            except (AttributeError, RuntimeError):
+                # No live kernel for ui_events to pump (e.g., inside a Shiny
+                # app). Fall through to the kernel-free path below.
+                pass
+
+        # No kernel pump available. The reply arrives via an event loop on
+        # another thread, so blocking is only safe when this thread is not
+        # itself running an event loop.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass  # No loop on this thread (e.g., a worker thread): safe to block.
+        else:
+            raise RuntimeError(
+                f"GeoLibre's {method}() blocks until the running app replies, "
+                "but this thread is running the event loop that would deliver "
+                "the reply, so waiting here would deadlock. In Jupyter, "
+                "install 'jupyter_ui_poll' to pump the kernel's event loop "
+                "instead. In Shiny, call blocking methods from a worker "
+                "thread -- e.g., inside `reactive.extended_task`, via "
+                "`asyncio.get_running_loop().run_in_executor(None, ...)` -- "
+                "or use a non-blocking alternative (e.g., set_center() "
+                "instead of fly_to(), or read the synced `project` trait "
+                "instead of get_center())."
+            )
+        while not slot["done"]:
+            _check_deadline()
+            time.sleep(0.05)
 
     def request(
         self,
