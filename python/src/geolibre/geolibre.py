@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import copy
 import csv
 import html as _html
@@ -635,12 +636,22 @@ class Map(anywidget.AnyWidget):
                     f"GeoLibre command {method!r} timed out after {timeout}s. "
                     "The map must be displayed and loaded before it can "
                     "answer; show the map, then retry or pass a larger "
-                    "timeout=."
+                    "timeout=. Outside Jupyter and Shiny, the reply must come "
+                    "from a running app on another thread."
                 )
 
         if ui_events is not None:
-            try:
-                with ui_events() as poll:
+            # Only entering the pump is guarded: an AttributeError or
+            # RuntimeError raised later (by poll() or a reply handler) is a real
+            # failure and must reach the caller instead of being swallowed.
+            with contextlib.ExitStack() as stack:
+                try:
+                    poll = stack.enter_context(ui_events())
+                except (AttributeError, RuntimeError):
+                    # No live kernel for ui_events to pump (e.g., inside a Shiny
+                    # app). Fall through to the kernel-free path below.
+                    poll = None
+                if poll is not None:
                     while not slot["done"]:
                         # Check before and after pumping: a slow poll() with a
                         # large event backlog could otherwise overrun a very
@@ -654,11 +665,7 @@ class Map(anywidget.AnyWidget):
                         # Hz spin (jupyter_ui_poll already pumps 10 kernel
                         # events per iteration).
                         time.sleep(0.05)
-                return
-            except (AttributeError, RuntimeError):
-                # No live kernel for ui_events to pump (e.g., inside a Shiny
-                # app). Fall through to the kernel-free path below.
-                pass
+                    return
 
         # No kernel pump available. The reply arrives via an event loop on
         # another thread, so blocking is only safe when this thread is not

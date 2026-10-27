@@ -169,6 +169,44 @@ def test_wait_for_result_falls_back_when_ui_events_has_no_kernel(monkeypatch):
     assert slot["done"]
 
 
+def test_wait_for_result_falls_back_when_ui_events_raises_on_call(monkeypatch):
+    # The no-kernel AttributeError can come from calling ui_events() itself,
+    # before its context manager is entered; that call must fall back too.
+    def broken_ui_events():
+        raise AttributeError("'NoneType' object has no attribute 'kernel'")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "jupyter_ui_poll",
+        types.SimpleNamespace(ui_events=broken_ui_events),
+    )
+    slot = {"done": False, "ok": False, "value": None, "error": None}
+    t = _resolve_slot_later(slot)
+    Map._wait_for_result(slot, "getCenter", 5)
+    t.join()
+    assert slot["done"]
+
+
+def test_wait_for_result_propagates_errors_raised_while_pumping(monkeypatch):
+    # Only "no kernel" should trigger the fallback. A failure inside the pump
+    # loop is a real error and must surface, not be swallowed into a sleep-poll.
+    def failing_poll(_n=1):
+        raise AttributeError("reply handler broke")
+
+    @contextlib.contextmanager
+    def pump_that_fails():
+        yield failing_poll
+
+    monkeypatch.setitem(
+        sys.modules,
+        "jupyter_ui_poll",
+        types.SimpleNamespace(ui_events=pump_that_fails),
+    )
+    slot = {"done": False, "ok": False, "value": None, "error": None}
+    with pytest.raises(AttributeError, match="reply handler broke"):
+        Map._wait_for_result(slot, "getCenter", 5)
+
+
 def test_result_for_unknown_request_is_ignored(m):
     # A late reply for a request that already timed out must not crash.
     m._on_custom_msg(
